@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-ReSpade (v1.09)
+ReSpade (v1.12)
 
 A Tkinter-based “Sam Spade” replacement with modern enhancements:
 
-- Shared input field; single “About” menu item
+- Shared input field; “Help → About” menu
 - Whois (single/bulk)
 - DNS lookup + Auth NS (ANY/A/AAAA/NS/MX/TXT/CNAME)
 - Custom DNS server (auto-populated)
@@ -16,7 +16,7 @@ A Tkinter-based “Sam Spade” replacement with modern enhancements:
 - Web Fetch (https→http fallback, raw/text, “No text…” message, blank-line collapse)
 - robots.txt fetch
 - SSL Info (certificate & cipher details)
-- Co-hosted (reverse IP lookup via HackerTarget with API key or ThreatCrowd fallback, alphabetized)
+- Co-hosted (ThreatCrowd + HackerTarget; provider selection; alphabetized; JSON errors handled)
 - Save Output / Save as Evidence (with metadata)
 - Download tab: non-HTML link discovery + checkbox / “Select All” / download
 - Clear button to wipe the output pane
@@ -27,7 +27,14 @@ Requires:
     pip install requests beautifulsoup4 python-whois
 """
 
-import sys, platform, threading, subprocess, socket, re, datetime, ssl
+import sys
+import platform
+import threading
+import subprocess
+import socket
+import re
+import datetime
+import ssl
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext, filedialog
 from urllib.parse import urlparse
@@ -36,17 +43,15 @@ import requests
 from bs4 import BeautifulSoup
 import whois
 
-__version__ = "1.09"
+__version__ = "1.12"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
-TLD_LIST     = ["com","net","org","io","co","us","uk","info","biz","xyz"]
-COMMON_PORTS = [21,22,23,25,53,80,110,143,443,3306,8080]
-DOWNLOAD_EXT = re.compile(
-    r"\.(pdf|zip|jpg|jpeg|png|gif|docx?|xlsx?|pptx?|mp3|mp4|mov)(?:\?.*)?$",
-    re.IGNORECASE
-)
+TLD_LIST         = ["com","net","org","io","co","us","uk","info","biz","xyz"]
+COMMON_PORTS     = [21,22,23,25,53,80,110,143,443,3306,8080]
+DOWNLOAD_EXT     = re.compile(r"\.(pdf|zip|jpg|jpeg|png|gif|docx?|xlsx?|pptx?|mp3|mp4|mov)(?:\?.*)?$", re.IGNORECASE)
+COHOST_PROVIDERS = ["ThreatCrowd", "HackerTarget", "Both"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -56,30 +61,33 @@ def normalize_host(raw: str) -> str:
     return p.netloc or p.path or ""
 
 def get_default_dns() -> str:
-    if platform.system()=="Windows":
+    if platform.system() == "Windows":
         try:
-            out=subprocess.check_output(["ipconfig","/all"], text=True, errors="ignore")
+            out = subprocess.check_output(["ipconfig","/all"], text=True, errors="ignore")
             for line in out.splitlines():
                 if "DNS Servers" in line:
-                    parts=line.split(":",1)
-                    if len(parts)==2 and parts[1].strip():
+                    parts = line.split(":",1)
+                    if len(parts) == 2 and parts[1].strip():
                         return parts[1].strip()
-        except: pass
+        except:
+            pass
     else:
         try:
             with open("/etc/resolv.conf") as f:
                 for line in f:
                     if line.startswith("nameserver"):
                         return line.split()[1]
-        except: pass
+        except:
+            pass
     return ""
 
 def run_subprocess(cmd, append):
     try:
-        p=subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                           stderr=subprocess.STDOUT, text=True)
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True)
     except Exception as e:
-        append(f"Error running {cmd!r}: {e}\n"); return
+        append(f"Error running {cmd!r}: {e}\n")
+        return
     for line in p.stdout:
         append(line)
     p.wait()
@@ -89,7 +97,8 @@ def collapse_blank_lines(text: str) -> str:
     for L in text.splitlines():
         if not L.strip():
             blank += 1
-            if blank <= 2: out.append(L)
+            if blank <= 2:
+                out.append(L)
         else:
             blank = 0
             out.append(L)
@@ -97,10 +106,9 @@ def collapse_blank_lines(text: str) -> str:
 
 def local_ip() -> str:
     try:
-        s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8",80))
-        ip=s.getsockname()[0]
-        s.close()
+        ip = s.getsockname()[0]; s.close()
         return ip
     except:
         return socket.gethostbyname(socket.gethostname())
@@ -109,16 +117,16 @@ def local_ip() -> str:
 # Core Functions
 # ─────────────────────────────────────────────────────────────────────────────
 def do_whois(dom, bulk, append):
-    host=normalize_host(dom)
+    host = normalize_host(dom)
     if not host:
         append("⚠️ no domain provided\n"); return
     if bulk:
         append(f"Bulk WHOIS of “{host}” across {len(TLD_LIST)} TLDs\n\n")
         for tld in TLD_LIST:
-            d=f"{host}.{tld}"
+            d = f"{host}.{tld}"
             append(f"=== WHOIS {d} ===\n")
             try:
-                data=whois.whois(d)
+                data = whois.whois(d)
                 for k,v in data.items():
                     append(f"{k}: {v}\n")
             except Exception as e:
@@ -127,56 +135,51 @@ def do_whois(dom, bulk, append):
     else:
         append(f"WHOIS lookup for {host}\n")
         try:
-            data=whois.whois(host)
+            data = whois.whois(host)
             for k,v in data.items():
                 append(f"{k}: {v}\n")
         except Exception as e:
             append(f"Error: {e}\n")
 
 def do_dns_lookup(dom, server, record, append):
-    host=normalize_host(dom)
+    host = normalize_host(dom)
     if not host:
-        append("⚠️ no hostname\n"); return
-    cmd=["nslookup",f"-type={record}",host]
-    if server.strip(): cmd.append(server.strip())
+        append("⚠️ no hostname provided\n"); return
+    cmd = ["nslookup", f"-type={record}", host]
+    if server.strip():
+        cmd.append(server.strip())
     append(f"> {' '.join(cmd)}\n")
     run_subprocess(cmd, append)
 
 def do_dns_ns(dom, server, append):
     append("\n")
-    host=normalize_host(dom)
+    host = normalize_host(dom)
     if not host:
-        append("⚠️ no hostname\n"); return
-    cmd=["nslookup","-type=NS",host]
-    if server.strip(): cmd.append(server.strip())
+        append("⚠️ no hostname provided\n"); return
+    cmd = ["nslookup","-type=NS",host]
+    if server.strip():
+        cmd.append(server.strip())
     append(f"> {' '.join(cmd)}\n")
     run_subprocess(cmd, append)
 
 def do_ping(target, use_v6, append):
-    host=normalize_host(target)
+    host = normalize_host(target)
     if not host:
-        append("⚠️ no target\n"); return
-    cnt="5"; sys=platform.system()
+        append("⚠️ no target provided\n"); return
+    cnt="5"; sys_name=platform.system()
     if use_v6:
-        cmd=["ping","-6","-n",cnt,host] if sys=="Windows" else ["ping6","-c",cnt,host]
+        cmd = ["ping","-6","-n",cnt,host] if sys_name=="Windows" else ["ping6","-c",cnt,host]
     else:
-        cmd=["ping","-n",cnt,host] if sys=="Windows" else ["ping","-c",cnt,host]
+        cmd = ["ping","-n",cnt,host] if sys_name=="Windows" else ["ping","-c",cnt,host]
     append(f"> {' '.join(cmd)}\n")
     run_subprocess(cmd, append)
 
-_private=re.compile
-_private_ranges=[
-    _private(r"^10\."), _private(r"^127\."),
-    _private(r"^192\.168\."), _private(r"^172\.(1[6-9]|2\d|3[0-1])\.")
-]
-def is_private(ip): return any(p.match(ip) for p in _private_ranges)
-
 def do_traceroute(target, use_v6, rev_dns, append):
-    host=normalize_host(target)
+    host = normalize_host(target)
     if not host:
-        append("⚠️ no target\n"); return
-    sys=platform.system()
-    if sys=="Windows":
+        append("⚠️ no target provided\n"); return
+    sys_name=platform.system()
+    if sys_name=="Windows":
         cmd=["tracert"]+(["-6"] if use_v6 else[])+(["-d"] if not rev_dns else[])+[host]
     else:
         cmd=["traceroute6",host] if use_v6 else ["traceroute","-n",host]
@@ -188,51 +191,56 @@ def do_traceroute(target, use_v6, rev_dns, append):
         m=re.search(r"(\d+\.\d+\.\d+\.\d+)",line)
         if m: hops.append(m.group(1))
     p.wait()
-    if rev_dns and sys!="Windows":
+    if rev_dns and sys_name!="Windows":
         append("\nReverse DNS on public hops:\n")
         for ip in hops:
-            if not is_private(ip):
+            if not ip.startswith(("10.","127.","192.168.","172.")):
                 try:
-                    name=socket.gethostbyaddr(ip)[0]; append(f"{ip}: {name}\n")
+                    name=socket.gethostbyaddr(ip)[0]
+                    append(f"{ip}: {name}\n")
                 except:
                     append(f"{ip}: (no PTR)\n")
 
 def do_ip_blocklist_check(raw, append):
     host=normalize_host(raw)
     if not host:
-        append("⚠️ no target\n"); return
+        append("⚠️ no target provided\n"); return
     try:
         ip=socket.gethostbyname(host)
         append(f"Resolved {host} → {ip}\n")
     except:
-        append("Cannot resolve host\n"); return
+        append("Cannot resolve host to IP\n"); return
     zones=["zen.spamhaus.org","bl.spamcop.net","dnsbl.sorbs.net"]
     append(f"Checking {ip} against DNSBLs:\n")
     for z in zones:
         q=".".join(reversed(ip.split(".")))+"."+z
-        try: socket.gethostbyname(q); append(f" LISTED in {z}\n")
-        except socket.gaierror: append(f" Not listed in {z}\n")
+        try:
+            socket.gethostbyname(q)
+            append(f" LISTED in {z}\n")
+        except socket.gaierror:
+            append(f" Not listed in {z}\n")
 
 def do_reverse_dns(raw, append):
     host=normalize_host(raw)
     if not host:
-        append("⚠️ no target\n"); return
+        append("⚠️ no target provided\n"); return
     try:
         ip=socket.gethostbyname(host); append(f"Resolved {host} → {ip}\n")
         names=socket.gethostbyaddr(ip)
         append(f"{ip} → {names[0]}\n")
-        for a in names[1]: append(f" alias: {a}\n")
+        for a in names[1]:
+            append(f" alias: {a}\n")
     except Exception as e:
         append(f"Reverse DNS error: {e}\n")
 
 def do_port_scan(raw, append):
     host=normalize_host(raw)
     if not host:
-        append("⚠️ no target\n"); return
+        append("⚠️ no target provided\n"); return
     try:
         ip=socket.gethostbyname(host); append(f"Resolved {host} → {ip}\n")
     except:
-        append("Cannot resolve host\n"); return
+        append("Cannot resolve host to IP\n"); return
     v6=":" in ip
     append(f"Port scanning {ip} on {len(COMMON_PORTS)} ports:\n")
     for p in COMMON_PORTS:
@@ -246,37 +254,47 @@ def do_port_scan(raw, append):
 
 def do_http_fetch(url, mode, append):
     if not url.strip():
-        append("⚠️ no URL\n"); return
+        append("⚠️ no URL provided\n"); return
     if not url.startswith("http"):
         url="https://"+url
     append(f"GET {url}\n")
-    try: r=requests.get(url,timeout=10)
+    try:
+        r=requests.get(url,timeout=10)
     except:
         url=re.sub(r"^https://","http://",url)
         append(f"(https failed) GET {url}\n")
-        try: r=requests.get(url,timeout=10)
-        except Exception as e: append(f"Fetch failed: {e}\n"); return
+        try:
+            r=requests.get(url,timeout=10)
+        except Exception as e:
+            append(f"Fetch failed: {e}\n")
+            return
     html=r.text
     if mode=="raw":
-        append(html); return
-    text=BeautifulSoup(html,"html.parser").get_text()
-    if not text.strip():
-        append("⚠️ No text found\n"); return
-    append(collapse_blank_lines(text)+"\n")
+        append(html)
+    else:
+        text=BeautifulSoup(html,"html.parser").get_text()
+        if not text.strip():
+            append("⚠️ No text found on page.\n")
+        else:
+            append(collapse_blank_lines(text)+"\n")
 
 def do_robots(raw, append):
     host=normalize_host(raw)
     if not host:
-        append("⚠️ no host\n"); return
+        append("⚠️ no host/URL provided\n"); return
     base=host if host.startswith("http") else "https://"+host
     url=base.rstrip("/")+"/robots.txt"
     append(f"GET {url}\n")
-    try: r=requests.get(url,timeout=10)
+    try:
+        r=requests.get(url,timeout=10)
     except:
         url=re.sub(r"^https://","http://",url)
         append(f"(https failed) GET {url}\n")
-        try: r=requests.get(url,timeout=10)
-        except Exception as e: append(f"Fetch failed: {e}\n"); return
+        try:
+            r=requests.get(url,timeout=10)
+        except Exception as e:
+            append(f"Fetch failed: {e}\n")
+            return
     if r.status_code==200:
         for L in r.text.splitlines(True): append(L)
     else:
@@ -285,7 +303,7 @@ def do_robots(raw, append):
 def do_ssl_data(raw, append):
     host=normalize_host(raw)
     if not host:
-        append("⚠️ no host\n"); return
+        append("⚠️ no host provided\n"); return
     port=443
     append(f"Connecting to {host}:{port} for SSL info...\n")
     try:
@@ -300,50 +318,63 @@ def do_ssl_data(raw, append):
     except Exception as e:
         append(f"SSL error: {e}\n")
 
-def do_cohosted(raw, api_key, append):
+def do_cohosted(raw, api_key, provider, append):
     host=normalize_host(raw)
     if not host:
-        append("⚠️ no host\n"); return
+        append("⚠️ no host provided\n"); return
     try:
         ip=socket.gethostbyname(host)
         append(f"Resolved {host} → {ip}\n")
     except Exception as e:
         append(f"Resolution failed: {e}\n"); return
-    # Try ThreatCrowd first (no key required)
-    append("Using ThreatCrowd API (no key required)...\n")
-    tc_url=f"https://www.threatcrowd.org/searchApi/v2/ip/report/?ip={ip}"
-    try:
-        r=requests.get(tc_url,timeout=10)
-        data=r.json()
-        res=data.get("resolutions") or []
-        if not res:
-            append("No hosts found via ThreatCrowd.\n")
-        else:
-            hosts=sorted({item["hostname"] for item in res})
-            append("Co-hosted domains (ThreatCrowd):\n")
-            for h in hosts:
-                append(h+"\n")
-    except Exception as e:
-        append(f"ThreatCrowd error: {e}\n")
 
-    # If API key provided, also try HackerTarget for more results
-    if api_key.strip():
-        append("\nUsing HackerTarget API for additional results...\n")
-        url=f"https://api.hackertarget.com/reverseiplookup/?apikey={api_key.strip()}&q={ip}"
-        append(f"Query: {url}\n")
+    results=[]
+
+    def query_threatcrowd():
+        append("\n[ThreatCrowd] querying HTTP...\n")
+        url=f"http://www.threatcrowd.org/searchApi/v2/ip/report/?ip={ip}"
+        try:
+            r=requests.get(url,timeout=10)
+            try:
+                data=r.json().get("resolutions") or []
+            except ValueError:
+                append("ThreatCrowd returned non-JSON response.\n"); return
+            hosts={item["hostname"] for item in data}
+            results.extend(hosts)
+        except Exception as e:
+            append(f"ThreatCrowd error: {e}\n")
+
+    def query_hackertarget():
+        append("\n[HackerTarget] querying API...\n")
+        if api_key.strip():
+            append("Using provided API key for increased quota.\n")
+            url=f"https://api.hackertarget.com/reverseiplookup/?apikey={api_key.strip()}&q={ip}"
+        else:
+            append("Using free endpoint (limit ~50/day).\n")
+            url=f"https://api.hackertarget.com/reverseiplookup/?q={ip}"
+        append(f"Request: {url}\n")
         try:
             r=requests.get(url,timeout=10)
             text=r.text.strip()
             if text and "No records" not in text:
-                hosts=text.splitlines()
-                hosts=sorted(set(hosts))
-                append("Additional co-hosted domains (HackerTarget):\n")
-                for h in hosts:
-                    append(h+"\n")
+                results.extend(text.splitlines())
             else:
-                append("No additional hosts via HackerTarget.\n")
+                append("No records from HackerTarget.\n")
         except Exception as e:
             append(f"HackerTarget error: {e}\n")
+
+    if provider in ("ThreatCrowd","Both"):
+        query_threatcrowd()
+    if provider in ("HackerTarget","Both"):
+        query_hackertarget()
+
+    unique=sorted(set(results))
+    if unique:
+        append("\nCo-hosted domains:\n")
+        for h in unique:
+            append(h+"\n")
+    else:
+        append("\nNo co-hosted domains found.\n")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # UI
@@ -354,9 +385,11 @@ class ReSpade(tk.Tk):
         self.title(f"ReSpade v{__version__}")
         self.geometry("920x660")
 
-        menu=tk.Menu(self)
-        menu.add_command(label="About",command=self.show_about)
-        self.config(menu=menu)
+        menubar=tk.Menu(self)
+        helpmenu=tk.Menu(menubar, tearoff=0)
+        helpmenu.add_command(label="About", command=self.show_about)
+        menubar.add_cascade(label="Help", menu=helpmenu)
+        self.config(menu=menubar)
 
         self.shared      = tk.StringVar()
         self.dns_srv     = tk.StringVar(value=get_default_dns())
@@ -364,26 +397,28 @@ class ReSpade(tk.Tk):
         self.ipv6_var    = tk.BooleanVar(value=False)
         self.rev_dns_var = tk.BooleanVar(value=False)
         self.ht_api_key  = tk.StringVar()
+        self.co_provider = tk.StringVar(value=COHOST_PROVIDERS[0])
 
         nb=ttk.Notebook(self)
         nb.pack(fill="both",expand=True)
 
-        tabs=[
-            ("Whois",        self.build_whois),
-            ("DNS",          self.build_dns),
-            ("Ping",         self.build_ping),
-            ("Traceroute",   self.build_trace),
-            ("IP Blocklist", self.build_blk),
-            ("Reverse DNS",  self.build_rev_dns),
-            ("Port Scan",    self.build_port_scan),
-            ("Web Fetch",    self.build_web_fetch),
-            ("Robots.txt",   self.build_robots),
-            ("SSL Info",     self.build_ssl),
-            ("Co-hosted",    self.build_cohosted),
-            ("Downloads",    self.build_downloads),
-        ]
-        for name,builder in tabs:
-            fr=ttk.Frame(nb); nb.add(fr,text=name); builder(fr)
+        for name, builder in [
+            ("Whois",       self.build_whois),
+            ("DNS",         self.build_dns),
+            ("Ping",        self.build_ping),
+            ("Traceroute",  self.build_trace),
+            ("IP Blocklist",self.build_blk),
+            ("Reverse DNS", self.build_rev_dns),
+            ("Port Scan",   self.build_port_scan),
+            ("Web Fetch",   self.build_web_fetch),
+            ("Robots.txt",  self.build_robots),
+            ("SSL Info",    self.build_ssl),
+            ("Co-hosted",   self.build_cohosted),
+            ("Downloads",   self.build_downloads),
+        ]:
+            frame=ttk.Frame(nb)
+            nb.add(frame, text=name)
+            builder(frame)
 
     def show_about(self):
         messagebox.showinfo("About ReSpade",
@@ -405,11 +440,11 @@ class ReSpade(tk.Tk):
         txt.pack(fill="both",expand=True,padx=10,pady=5)
 
         clear.config(command=lambda: txt.delete("1.0","end"))
-        copy.config(command=lambda: self._copy(txt.get("1.0","end")))
-        save.config(command=lambda: self._save(txt.get("1.0","end")))
-        ev.config(command=lambda: self._save_evidence(txt.get("1.0","end")))
+        copy .config(command=lambda: self._copy(txt.get("1.0","end")))
+        save .config(command=lambda: self._save(txt.get("1.0","end")))
+        ev   .config(command=lambda: self._save_evidence(txt.get("1.0","end")))
 
-        return txt,run
+        return txt, run
 
     def _copy(self,content):
         self.clipboard_clear(); self.clipboard_append(content)
@@ -441,12 +476,14 @@ class ReSpade(tk.Tk):
         body=content.strip() or "(no output)"
         lines.append(body)
         out="\n".join(lines)
+
         fn=filedialog.asksaveasfilename(defaultextension=".txt",
             filetypes=[("Text","*.txt"),("All","*.*")])
         if fn:
             with open(fn,"w",encoding="utf-8") as f: f.write(out)
             messagebox.showinfo("Saved","Evidence saved to "+fn)
 
+    # Build methods for each tab
     def build_whois(self,f):
         txt,run_btn=self._common_ui(f)
         run_btn.config(command=lambda:
@@ -462,9 +499,7 @@ class ReSpade(tk.Tk):
     def build_dns(self,f):
         txt,run_btn=self._common_ui(f)
         run_btn.config(command=lambda:
-            threading.Thread(target=lambda: do_dns_ns(self.shared.get(),
-                                                      self.dns_srv.get(),
-                                                      lambda l: txt.insert("end",l)),
+            threading.Thread(target=lambda: do_dns_ns(self.shared.get(),self.dns_srv.get(),lambda l:txt.insert("end",l)),
                              daemon=True).start())
         frm=ttk.Frame(f); frm.pack(fill="x",padx=10)
         ttk.Label(frm,text="DNS Server:").pack(side="left")
@@ -474,16 +509,11 @@ class ReSpade(tk.Tk):
         ttk.OptionMenu(frm,self.dns_record,*opts).pack(side="left",padx=5)
         btnf=ttk.Frame(f); btnf.pack(fill="x",padx=10,pady=(0,5))
         ttk.Button(btnf,text="Lookup",command=lambda:
-            threading.Thread(target=lambda: do_dns_lookup(self.shared.get(),
-                                                          self.dns_srv.get(),
-                                                          self.dns_record.get(),
-                                                          lambda l: txt.insert("end",l)),
+            threading.Thread(target=lambda: do_dns_lookup(self.shared.get(),self.dns_srv.get(),self.dns_record.get(),lambda l:txt.insert("end",l)),
                              daemon=True).start()
         ).pack(side="left")
         ttk.Button(btnf,text="Auth NS",command=lambda:
-            threading.Thread(target=lambda: do_dns_ns(self.shared.get(),
-                                                     self.dns_srv.get(),
-                                                     lambda l: txt.insert("end",l)),
+            threading.Thread(target=lambda: do_dns_ns(self.shared.get(),self.dns_srv.get(),lambda l:txt.insert("end",l)),
                              daemon=True).start()
         ).pack(side="left",padx=5)
 
@@ -491,9 +521,7 @@ class ReSpade(tk.Tk):
         txt,run_btn=self._common_ui(f)
         ttk.Checkbutton(f,text="Use IPv6",variable=self.ipv6_var).pack(anchor="w",padx=10,pady=(0,5))
         run_btn.config(command=lambda:
-            threading.Thread(target=lambda: do_ping(self.shared.get(),
-                                                   self.ipv6_var.get(),
-                                                   lambda l: txt.insert("end",l)),
+            threading.Thread(target=lambda: do_ping(self.shared.get(),self.ipv6_var.get(),lambda l:txt.insert("end",l)),
                              daemon=True).start())
 
     def build_trace(self,f):
@@ -502,31 +530,25 @@ class ReSpade(tk.Tk):
         ttk.Checkbutton(opts,text="Use IPv6",variable=self.ipv6_var).pack(side="left")
         ttk.Checkbutton(opts,text="Reverse DNS",variable=self.rev_dns_var).pack(side="left",padx=10)
         run_btn.config(command=lambda:
-            threading.Thread(target=lambda: do_traceroute(self.shared.get(),
-                                                         self.ipv6_var.get(),
-                                                         self.rev_dns_var.get(),
-                                                         lambda l: txt.insert("end",l)),
+            threading.Thread(target=lambda: do_traceroute(self.shared.get(),self.ipv6_var.get(),self.rev_dns_var.get(),lambda l:txt.insert("end",l)),
                              daemon=True).start())
 
     def build_blk(self,f):
         txt,run_btn=self._common_ui(f)
         run_btn.config(command=lambda:
-            threading.Thread(target=lambda: do_ip_blocklist_check(self.shared.get(),
-                                                                  lambda l: txt.insert("end",l)),
+            threading.Thread(target=lambda: do_ip_blocklist_check(self.shared.get(),lambda l:txt.insert("end",l)),
                              daemon=True).start())
 
     def build_rev_dns(self,f):
         txt,run_btn=self._common_ui(f)
         run_btn.config(command=lambda:
-            threading.Thread(target=lambda: do_reverse_dns(self.shared.get(),
-                                                          lambda l: txt.insert("end",l)),
+            threading.Thread(target=lambda: do_reverse_dns(self.shared.get(),lambda l:txt.insert("end",l)),
                              daemon=True).start())
 
     def build_port_scan(self,f):
         txt,run_btn=self._common_ui(f)
         run_btn.config(command=lambda:
-            threading.Thread(target=lambda: do_port_scan(self.shared.get(),
-                                                        lambda l: txt.insert("end",l)),
+            threading.Thread(target=lambda: do_port_scan(self.shared.get(),lambda l:txt.insert("end",l)),
                              daemon=True).start())
 
     def build_web_fetch(self,f):
@@ -534,7 +556,7 @@ class ReSpade(tk.Tk):
         mode_var=tk.StringVar(value="text")
         rf=ttk.Frame(f); rf.pack(fill="x",padx=10)
         ttk.Radiobutton(rf,text="Text Only",variable=mode_var,value="text").pack(side="left")
-        ttk.Radiobutton(rf,text="Raw HTML",variable=mode_var,value="raw").pack(side="left",padx=10)
+        ttk.Radiobutton(rf,text="Raw HTML", variable=mode_var,value="raw").pack(side="left",padx=10)
         btnf=ttk.Frame(f); btnf.pack(fill="x",padx=10,pady=(5,0))
         run=ttk.Button(btnf,text="Run",width=10); ext=ttk.Button(btnf,text="Extract Links",width=15)
         copy=ttk.Button(btnf,text="Copy Output",width=15); save=ttk.Button(btnf,text="Save Output",width=15)
@@ -549,8 +571,7 @@ class ReSpade(tk.Tk):
 
         def do_run():
             txt.delete("1.0","end")
-            threading.Thread(target=lambda: do_http_fetch(self.shared.get(),
-                                                         mode_var.get(),append),
+            threading.Thread(target=lambda: do_http_fetch(self.shared.get(),mode_var.get(),append),
                              daemon=True).start()
 
         def do_ext():
@@ -562,33 +583,35 @@ class ReSpade(tk.Tk):
 
         run.config(command=do_run)
         ext.config(command=do_ext)
-        copy.config(command=lambda:self._copy(txt.get("1.0","end")))
-        save.config(command=lambda:self._save(txt.get("1.0","end")))
-        ev.config(command=lambda:self._save_evidence(txt.get("1.0","end")))
+        copy.config(command=lambda: self._copy(txt.get("1.0","end")))
+        save.config(command=lambda: self._save(txt.get("1.0","end")))
+        ev.config(command=lambda: self._save_evidence(txt.get("1.0","end")))
 
     def build_robots(self,f):
         txt,run_btn=self._common_ui(f)
         run_btn.config(command=lambda:
-            threading.Thread(target=lambda: do_robots(self.shared.get(),
-                                                    lambda l: txt.insert("end",l)),
+            threading.Thread(target=lambda: do_robots(self.shared.get(),lambda l:txt.insert("end",l)),
                              daemon=True).start())
 
     def build_ssl(self,f):
         txt,run_btn=self._common_ui(f)
         run_btn.config(command=lambda:
-            threading.Thread(target=lambda: do_ssl_data(self.shared.get(),
-                                                       lambda l: txt.insert("end",l)),
+            threading.Thread(target=lambda: do_ssl_data(self.shared.get(),lambda l:txt.insert("end",l)),
                              daemon=True).start())
 
     def build_cohosted(self,f):
-        ttk.Label(f,text="HackerTarget API Key (optional; free endpoint no key up to ~50/day):"
-        ).pack(anchor="w",padx=10,pady=(5,0))
-        ttk.Entry(f,textvariable=self.ht_api_key).pack(fill="x",padx=10,pady=(0,5))
+        ttk.Label(f,text="HackerTarget API Key (optional):").pack(anchor="w",padx=10,pady=(5,0))
+        ttk.Entry(f,textvariable=self.ht_api_key).pack(fill="x",padx=10)
+        ttk.Label(f,text="Provider:").pack(anchor="w",padx=10,pady=(5,0))
+        ttk.Combobox(f,textvariable=self.co_provider,values=COHOST_PROVIDERS,state="readonly")\
+            .pack(fill="x",padx=10,pady=(0,5))
+
         txt,run_btn=self._common_ui(f)
         run_btn.config(command=lambda:
             threading.Thread(target=lambda: do_cohosted(self.shared.get(),
                                                        self.ht_api_key.get(),
-                                                       lambda l: txt.insert("end",l)),
+                                                       self.co_provider.get(),
+                                                       lambda l:txt.insert("end",l)),
                              daemon=True).start())
 
     def _extract_links(self,url,append):
@@ -652,8 +675,8 @@ class ReSpade(tk.Tk):
                     messagebox.showwarning("Download failed",f"{full}: {e}")
             messagebox.showinfo("Done","Downloads complete.")
 
-        fetch.config(command=lambda: threading.Thread(target=fetch_files,daemon=True).start())
-        sel.config(command=toggle_all)
+        fetch.config(command=lambda:threading.Thread(target=fetch_files,daemon=True).start())
+        sel  .config(command=toggle_all)
         ttk.Button(f,text="Download Selected",command=download_sel).pack(padx=10,pady=(0,5))
 
 if __name__=="__main__":
